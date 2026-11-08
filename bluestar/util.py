@@ -1,9 +1,12 @@
-"""Small helpers: icons, profile names, persistent settings."""
+"""Shared helpers: profile names, labels, settings, launching the TUI in a terminal."""
 
+import asyncio
 import json
 import os
-
-from gi.repository import Gdk, GLib, Gtk
+import shutil
+import signal
+import subprocess
+import sys
 
 _BASE_UUID_SUFFIX = "-0000-1000-8000-00805f9b34fb"
 
@@ -44,23 +47,23 @@ PROFILE_NAMES = {
     0xFE2C: "Google Fast Pair",
 }
 
-ICON_FALLBACKS = {
-    "audio-card": ["audio-speakers", "audio-card"],
-    "audio-headset": ["audio-headset", "audio-headphones"],
-    "audio-headphones": ["audio-headphones", "audio-headset"],
-    "input-gaming": ["input-gaming"],
-    "input-keyboard": ["input-keyboard"],
-    "input-mouse": ["input-mouse"],
-    "input-tablet": ["input-tablet"],
-    "phone": ["phone", "smartphone"],
-    "computer": ["computer"],
-    "camera-photo": ["camera-photo"],
-    "camera-video": ["camera-video"],
-    "printer": ["printer"],
-    "modem": ["network-wireless"],
-    "network-wireless": ["network-wireless"],
-    "multimedia-player": ["multimedia-player"],
-    "video-display": ["video-display"],
+TYPE_LABELS = {
+    "audio-card": "speaker",
+    "audio-headset": "headset",
+    "audio-headphones": "headphones",
+    "input-gaming": "gamepad",
+    "input-keyboard": "keyboard",
+    "input-mouse": "mouse",
+    "input-tablet": "tablet",
+    "phone": "phone",
+    "computer": "computer",
+    "camera-photo": "camera",
+    "camera-video": "camera",
+    "printer": "printer",
+    "modem": "modem",
+    "network-wireless": "network",
+    "multimedia-player": "media",
+    "video-display": "display",
 }
 
 
@@ -72,31 +75,33 @@ def profile_name(uuid):
     return None
 
 
-def device_icon_name(icon):
-    display = Gdk.Display.get_default()
-    theme = Gtk.IconTheme.get_for_display(display) if display else None
-    candidates = ICON_FALLBACKS.get(icon, [icon] if icon else [])
-    for name in candidates:
-        if theme is None or theme.has_icon(f"{name}-symbolic"):
-            return f"{name}-symbolic"
-    return "bluetooth-symbolic"
+def type_label(icon):
+    return TYPE_LABELS.get(icon, icon.split("-")[-1] if icon else "")
 
 
-def battery_icon_name(percent):
-    level = min(100, max(0, int(round(percent / 10.0)) * 10))
-    return f"battery-level-{level}-symbolic"
-
-
-def signal_text(rssi):
+def signal_bars(rssi):
+    """RSSI as a little 4-step meter, e.g. ▂▄▆_ ."""
     if rssi is None:
-        return None
-    if rssi >= -60:
-        return "Excellent signal"
-    if rssi >= -70:
-        return "Good signal"
-    if rssi >= -80:
-        return "Fair signal"
-    return "Weak signal"
+        return ""
+    level = 4 if rssi >= -60 else 3 if rssi >= -70 else 2 if rssi >= -80 else 1
+    return "".join(ch if i < level else "_" for i, ch in enumerate("▂▄▆█"))
+
+
+def battery_bar(percent, width=5):
+    if percent is None:
+        return ""
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return f"[{'|' * filled}{'.' * (width - filled)}] {percent:>3}%"
+
+
+def device_name_from_path(path):
+    return path.rsplit("/", 1)[-1].replace("dev_", "").replace("_", ":")
+
+
+# -- settings ----------------------------------------------------------------------
+
+def _config_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bluestar")
 
 
 class Settings:
@@ -106,10 +111,12 @@ class Settings:
         "show-unnamed": False,
         "notifications": True,
         "adapter": None,
+        # Command used by the tray / --toggle to open the TUI; empty = auto-detect.
+        "terminal": [],
     }
 
     def __init__(self):
-        self.path = os.path.join(GLib.get_user_config_dir(), "bluestar", "settings.json")
+        self.path = os.path.join(_config_dir(), "settings.json")
         self.data = dict(self.DEFAULTS)
         try:
             with open(self.path, encoding="utf-8") as fh:
@@ -130,3 +137,104 @@ class Settings:
             os.replace(tmp, self.path)
         except OSError:
             pass
+
+
+# -- rfkill -------------------------------------------------------------------------
+
+async def set_powered(adapter, value):
+    """Power an adapter on/off, unblocking rfkill first if that is what stands in the way."""
+    from .bluez import BluezError
+
+    try:
+        await adapter.set_powered(value)
+    except BluezError as err:
+        blocked = err.short == "Blocked" or "rfkill" in err.message.lower()
+        if not (value and blocked and shutil.which("rfkill")):
+            raise
+        proc = await asyncio.create_subprocess_exec("rfkill", "unblock", "bluetooth")
+        await proc.wait()
+        await asyncio.sleep(0.7)  # give the kernel a moment to bring the controller back
+        await adapter.set_powered(True)
+
+
+# -- TUI window management ----------------------------------------------------------------
+
+APP_ID = "bluestar"  # window class / app_id of the terminal running the TUI
+
+
+def _runtime_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+
+
+PIDFILE = os.path.join(_runtime_dir(), "bluestar-tui.pid")
+
+
+def write_pidfile():
+    try:
+        with open(PIDFILE, "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def remove_pidfile():
+    try:
+        with open(PIDFILE) as fh:
+            if fh.read().strip() == str(os.getpid()):
+                os.unlink(PIDFILE)
+    except OSError:
+        pass
+
+
+def running_tui_pid():
+    try:
+        with open(PIDFILE) as fh:
+            pid = int(fh.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def terminal_command(settings):
+    custom = settings["terminal"]
+    if custom:
+        return list(custom)
+    for term, args in (
+        ("kitty", ["--class", APP_ID, "--title", "bluestar", "-o", "remember_window_size=no",
+                   "-o", "initial_window_width=1000", "-o", "initial_window_height=600"]),
+        ("foot", ["--app-id", APP_ID, "--title", "bluestar"]),
+        ("alacritty", ["--class", APP_ID, "--title", "bluestar", "-e"]),
+        ("wezterm", ["start", "--class", APP_ID, "--"]),
+        ("ghostty", [f"--class=io.github.{APP_ID}", "--title=bluestar", "-e"]),
+    ):
+        if shutil.which(term):
+            return [term, *args]
+    return ["x-terminal-emulator", "-e"]
+
+
+def bluestar_command():
+    exe = shutil.which("bluestar")
+    if exe:
+        return [exe]
+    return [sys.executable, "-m", "bluestar"]
+
+
+def toggle_tui(settings=None):
+    """Close the TUI if it is running, otherwise open it in a new terminal window."""
+    pid = running_tui_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return
+        except OSError:
+            pass
+    open_tui(settings)
+
+
+def open_tui(settings=None):
+    if running_tui_pid():
+        return
+    cmd = terminal_command(settings or Settings()) + bluestar_command()
+    subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

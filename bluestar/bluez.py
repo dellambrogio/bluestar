@@ -1,6 +1,9 @@
-"""Thin GObject wrapper around the BlueZ D-Bus API (org.bluez on the system bus)."""
+"""Asyncio client for the BlueZ D-Bus API (org.bluez on the system bus), built on dbus-fast."""
 
-from gi.repository import Gio, GLib, GObject
+import asyncio
+
+from dbus_fast import BusType, Message, MessageType, Variant
+from dbus_fast.aio import MessageBus
 
 BUS_NAME = "org.bluez"
 ADAPTER_IFACE = "org.bluez.Adapter1"
@@ -8,113 +11,113 @@ DEVICE_IFACE = "org.bluez.Device1"
 BATTERY_IFACE = "org.bluez.Battery1"
 AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
+OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 
-# Connecting to some devices (e.g. headsets) can easily take 20+ seconds.
-LONG_TIMEOUT_MS = 60_000
+DEFAULT_TIMEOUT = 25
+LONG_TIMEOUT = 60      # connecting a headset can easily take 20+ seconds
+PAIR_TIMEOUT = 120     # pairing waits for the user to type/confirm codes
 
 
 class BluezError(Exception):
     def __init__(self, name, message):
         super().__init__(message)
         self.name = name or ""
-        self.message = message
+        self.message = message or self.name.rsplit(".", 1)[-1]
+
+    @property
+    def short(self):
+        return self.name.rsplit(".", 1)[-1]
 
 
-def _to_error(err):
-    name = Gio.DBusError.get_remote_error(err)
-    Gio.DBusError.strip_remote_error(err)
-    return BluezError(name, err.message)
+def _unwrap(value):
+    if isinstance(value, Variant):
+        return _unwrap(value.value)
+    if isinstance(value, dict):
+        return {k: _unwrap(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unwrap(v) for v in value]
+    return value
 
 
-class BluezObject(GObject.Object):
-    """Base class for adapters and devices. Emits ``changed`` on any property change."""
+class _View:
+    """Read-only view on one BlueZ object; always reflects the latest cached properties."""
 
-    __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, ())}
-
-    main_iface = None
+    iface = None
 
     def __init__(self, client, path):
-        super().__init__()
         self.client = client
         self.path = path
 
-    def _proxy(self, iface=None):
-        return self.client.manager.get_interface(self.path, iface or self.main_iface)
-
     def _get(self, name, default=None, iface=None):
-        proxy = self._proxy(iface)
-        if proxy is None:
-            return default
-        value = proxy.get_cached_property(name)
-        return default if value is None else value.unpack()
+        return self.client.objects.get(self.path, {}).get(iface or self.iface, {}).get(name, default)
 
-    def _set(self, name, variant, callback=None, iface=None):
-        params = GLib.Variant("(ssv)", (iface or self.main_iface, name, variant))
-        self.client.call(self.path, PROPS_IFACE, "Set", params, callback)
+    async def _set(self, name, signature, value):
+        await self.client.call(self.path, PROPS_IFACE, "Set", "ssv",
+                               [self.iface, name, Variant(signature, value)])
 
-    def _call(self, method, params=None, callback=None, timeout=-1, iface=None):
-        self.client.call(self.path, iface or self.main_iface, method, params, callback, timeout)
+    async def _call(self, member, signature="", body=None, timeout=DEFAULT_TIMEOUT):
+        return await self.client.call(self.path, self.iface, member, signature, body or [], timeout)
+
+    def __eq__(self, other):
+        return isinstance(other, _View) and other.path == self.path
+
+    def __hash__(self):
+        return hash(self.path)
 
 
-class Adapter(BluezObject):
-    main_iface = ADAPTER_IFACE
+class Adapter(_View):
+    iface = ADAPTER_IFACE
 
-    address = property(lambda self: self._get("Address", ""))
-    name = property(lambda self: self._get("Name", ""))
-    alias = property(lambda self: self._get("Alias", "") or self.name or self.address)
-    powered = property(lambda self: self._get("Powered", False))
-    power_state = property(lambda self: self._get("PowerState", "on" if self.powered else "off"))
-    discoverable = property(lambda self: self._get("Discoverable", False))
-    discoverable_timeout = property(lambda self: self._get("DiscoverableTimeout", 0))
-    pairable = property(lambda self: self._get("Pairable", False))
-    discovering = property(lambda self: self._get("Discovering", False))
-
-    def set_powered(self, value, callback=None):
-        self._set("Powered", GLib.Variant("b", value), callback)
-
-    def set_discoverable(self, value, callback=None):
-        self._set("Discoverable", GLib.Variant("b", value), callback)
-
-    def set_discoverable_timeout(self, seconds, callback=None):
-        self._set("DiscoverableTimeout", GLib.Variant("u", int(seconds)), callback)
-
-    def set_pairable(self, value, callback=None):
-        self._set("Pairable", GLib.Variant("b", value), callback)
-
-    def set_alias(self, value, callback=None):
-        self._set("Alias", GLib.Variant("s", value), callback)
-
-    def start_discovery(self, callback=None):
-        self._call("StartDiscovery", None, callback)
-
-    def stop_discovery(self, callback=None):
-        self._call("StopDiscovery", None, callback)
-
-    def remove_device(self, device, callback=None):
-        self._call("RemoveDevice", GLib.Variant("(o)", (device.path,)), callback)
+    address = property(lambda s: s._get("Address", ""))
+    name = property(lambda s: s._get("Name", ""))
+    alias = property(lambda s: s._get("Alias") or s.name or s.address)
+    powered = property(lambda s: s._get("Powered", False))
+    power_state = property(lambda s: s._get("PowerState", "on" if s.powered else "off"))
+    discoverable = property(lambda s: s._get("Discoverable", False))
+    discoverable_timeout = property(lambda s: s._get("DiscoverableTimeout", 0))
+    pairable = property(lambda s: s._get("Pairable", False))
+    discovering = property(lambda s: s._get("Discovering", False))
 
     @property
     def devices(self):
-        return [d for d in self.client.devices.values() if d.adapter_path == self.path]
+        return [d for d in self.client.devices if d.adapter_path == self.path]
+
+    async def set_powered(self, value):
+        await self._set("Powered", "b", value)
+
+    async def set_discoverable(self, value):
+        await self._set("Discoverable", "b", value)
+
+    async def set_alias(self, value):
+        await self._set("Alias", "s", value)
+
+    async def start_discovery(self):
+        await self._call("StartDiscovery")
+
+    async def stop_discovery(self):
+        await self._call("StopDiscovery")
+
+    async def remove_device(self, device):
+        await self._call("RemoveDevice", "o", [device.path])
 
 
-class Device(BluezObject):
-    main_iface = DEVICE_IFACE
+class Device(_View):
+    iface = DEVICE_IFACE
 
-    address = property(lambda self: self._get("Address", ""))
-    name = property(lambda self: self._get("Name"))
-    alias = property(lambda self: self._get("Alias") or self.address)
-    icon = property(lambda self: self._get("Icon", ""))
-    device_class = property(lambda self: self._get("Class"))
-    adapter_path = property(lambda self: self._get("Adapter", ""))
-    paired = property(lambda self: self._get("Paired", False))
-    bonded = property(lambda self: self._get("Bonded", False))
-    trusted = property(lambda self: self._get("Trusted", False))
-    blocked = property(lambda self: self._get("Blocked", False))
-    connected = property(lambda self: self._get("Connected", False))
-    rssi = property(lambda self: self._get("RSSI"))
-    uuids = property(lambda self: self._get("UUIDs", []))
-    modalias = property(lambda self: self._get("Modalias"))
+    address = property(lambda s: s._get("Address", ""))
+    name = property(lambda s: s._get("Name"))
+    alias = property(lambda s: s._get("Alias") or s.address)
+    icon = property(lambda s: s._get("Icon", ""))
+    device_class = property(lambda s: s._get("Class"))
+    adapter_path = property(lambda s: s._get("Adapter", ""))
+    paired = property(lambda s: s._get("Paired", False))
+    bonded = property(lambda s: s._get("Bonded", False))
+    trusted = property(lambda s: s._get("Trusted", False))
+    blocked = property(lambda s: s._get("Blocked", False))
+    connected = property(lambda s: s._get("Connected", False))
+    rssi = property(lambda s: s._get("RSSI"))
+    uuids = property(lambda s: s._get("UUIDs", []))
+    modalias = property(lambda s: s._get("Modalias"))
 
     @property
     def has_name(self):
@@ -126,153 +129,158 @@ class Device(BluezObject):
 
     @property
     def adapter(self):
-        return self.client.adapters.get(self.adapter_path)
-
-    def connect_device(self, callback=None):
-        self._call("Connect", None, callback, LONG_TIMEOUT_MS)
-
-    def disconnect_device(self, callback=None):
-        self._call("Disconnect", None, callback, LONG_TIMEOUT_MS)
-
-    def pair(self, callback=None):
-        # Pairing waits for the user to type/confirm codes, so be generous.
-        self._call("Pair", None, callback, 120_000)
-
-    def cancel_pairing(self, callback=None):
-        self._call("CancelPairing", None, callback)
-
-    def set_trusted(self, value, callback=None):
-        self._set("Trusted", GLib.Variant("b", value), callback)
-
-    def set_blocked(self, value, callback=None):
-        self._set("Blocked", GLib.Variant("b", value), callback)
-
-    def set_alias(self, value, callback=None):
-        self._set("Alias", GLib.Variant("s", value), callback)
+        return self.client.adapter(self.adapter_path)
 
     def sort_key(self):
-        return (not self.connected, self.alias.casefold(), self.address)
+        if self.paired:
+            return (0, not self.connected, self.alias.casefold(), self.address)
+        rssi = self.rssi if self.rssi is not None else -999
+        return (1, not self.has_name, -rssi, self.alias.casefold(), self.address)
+
+    async def connect(self):
+        await self._call("Connect", timeout=LONG_TIMEOUT)
+
+    async def disconnect(self):
+        await self._call("Disconnect", timeout=LONG_TIMEOUT)
+
+    async def pair(self):
+        await self._call("Pair", timeout=PAIR_TIMEOUT)
+
+    async def cancel_pairing(self):
+        await self._call("CancelPairing")
+
+    async def set_trusted(self, value):
+        await self._set("Trusted", "b", value)
+
+    async def set_blocked(self, value):
+        await self._set("Blocked", "b", value)
+
+    async def set_alias(self, value):
+        await self._set("Alias", "s", value)
 
 
-class BluezClient(GObject.Object):
-    """Tracks every adapter/device BlueZ exposes and keeps them up to date."""
+class Bluez:
+    """Keeps a live mirror of every BlueZ object. ``listeners`` are called (coalesced) on change.
 
-    __gsignals__ = {
-        "adapter-added": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
-        "adapter-removed": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
-        "device-added": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
-        "device-removed": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
-        # Emitted (coalesced) whenever anything at all changes.
-        "changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
-    }
+    Each listener gets the set of object paths that changed since the last call.
+    """
 
     def __init__(self):
-        super().__init__()
-        self.conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-        self.manager = Gio.DBusObjectManagerClient.new_sync(
-            self.conn, Gio.DBusObjectManagerClientFlags.NONE, BUS_NAME, "/", None, None, None
-        )
-        self.adapters = {}
-        self.devices = {}
-        self._changed_pending = False
+        self.bus = None
+        self.objects = {}
+        self.listeners = []
+        self.available = False
+        self._dirty = set()
+        self._flush_scheduled = False
 
-        self.manager.connect("object-added", self._on_object_added)
-        self.manager.connect("object-removed", self._on_object_removed)
-        self.manager.connect("interface-added", self._on_interface_added)
-        self.manager.connect("interface-removed", self._on_interface_removed)
-        self.manager.connect("interface-proxy-properties-changed", self._on_props_changed)
+    async def start(self):
+        self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        for rule in (
+            f"type='signal',sender='{BUS_NAME}',interface='{OM_IFACE}'",
+            f"type='signal',sender='{BUS_NAME}',interface='{PROPS_IFACE}',member='PropertiesChanged'",
+            f"type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{BUS_NAME}'",
+        ):
+            await self._dbus_call("AddMatch", "s", [rule])
+        self.bus.add_message_handler(self._on_message)
+        await self.reload()
+        return self
 
-        for obj in self.manager.get_objects():
-            for iface in obj.get_interfaces():
-                self._add(obj.get_object_path(), iface.get_interface_name(), emit=False)
+    async def reload(self):
+        try:
+            reply = await self.call("/", OM_IFACE, "GetManagedObjects")
+        except BluezError:
+            self.objects = {}
+            self.available = False
+        else:
+            self.objects = _unwrap(reply[0])
+            self.available = True
+        self._mark(*self.objects.keys(), "/")
 
-    # -- public helpers -------------------------------------------------
+    # -- queries ------------------------------------------------------------------
 
-    def call(self, path, iface, method, params=None, callback=None, timeout=-1):
-        """Asynchronous D-Bus call; ``callback(error_or_None, result_variant)``."""
+    @property
+    def adapters(self):
+        return sorted((Adapter(self, p) for p, i in self.objects.items() if ADAPTER_IFACE in i),
+                      key=lambda a: a.path)
 
-        def done(conn, res):
+    @property
+    def devices(self):
+        return [Device(self, p) for p, i in self.objects.items() if DEVICE_IFACE in i]
+
+    def adapter(self, path):
+        return Adapter(self, path) if ADAPTER_IFACE in self.objects.get(path, {}) else None
+
+    def device(self, path):
+        return Device(self, path) if DEVICE_IFACE in self.objects.get(path, {}) else None
+
+    def default_adapter(self, preferred_address=None):
+        adapters = self.adapters
+        for a in adapters:
+            if preferred_address and a.address == preferred_address:
+                return a
+        powered = [a for a in adapters if a.powered]
+        return (powered or adapters or [None])[0]
+
+    # -- calls --------------------------------------------------------------------
+
+    async def call(self, path, iface, member, signature="", body=None, timeout=DEFAULT_TIMEOUT):
+        msg = Message(destination=BUS_NAME, path=path, interface=iface, member=member,
+                      signature=signature, body=body or [])
+        try:
+            reply = await asyncio.wait_for(self.bus.call(msg), timeout)
+        except asyncio.TimeoutError:
+            raise BluezError("org.bluez.Error.Timeout", "Timed out") from None
+        if reply.message_type == MessageType.ERROR:
+            raise BluezError(reply.error_name, reply.body[0] if reply.body else "")
+        return reply.body
+
+    async def _dbus_call(self, member, signature, body):
+        await self.bus.call(Message(destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+                                    interface="org.freedesktop.DBus", member=member,
+                                    signature=signature, body=body))
+
+    # -- signals ------------------------------------------------------------------
+
+    def _mark(self, *paths):
+        self._dirty.update(paths)
+        if self._flush_scheduled:
+            return
+        self._flush_scheduled = True
+        asyncio.get_running_loop().call_soon(self._flush)
+
+    def _flush(self):
+        self._flush_scheduled = False
+        dirty, self._dirty = self._dirty, set()
+        for listener in list(self.listeners):
             try:
-                result = conn.call_finish(res)
-            except GLib.Error as err:
-                if callback:
-                    callback(_to_error(err), None)
+                listener(dirty)
+            except Exception as exc:  # a broken listener must not stop the others
+                print(f"bluestar: listener error: {exc!r}")
+
+    def _on_message(self, msg):
+        if msg.message_type != MessageType.SIGNAL:
+            return
+        if msg.member == "NameOwnerChanged" and msg.body and msg.body[0] == BUS_NAME:
+            asyncio.ensure_future(self.reload())
+            return
+        if msg.interface == OM_IFACE and msg.member == "InterfacesAdded":
+            path, ifaces = msg.body
+            self.objects.setdefault(path, {}).update(_unwrap(ifaces))
+            self._mark(path)
+        elif msg.interface == OM_IFACE and msg.member == "InterfacesRemoved":
+            path, names = msg.body
+            obj = self.objects.get(path, {})
+            for name in names:
+                obj.pop(name, None)
+            if not obj:
+                self.objects.pop(path, None)
+            self._mark(path)
+        elif msg.interface == PROPS_IFACE and msg.member == "PropertiesChanged":
+            if not msg.path.startswith("/org/bluez"):
                 return
-            if callback:
-                callback(None, result)
-
-        self.conn.call(BUS_NAME, path, iface, method, params, None,
-                       Gio.DBusCallFlags.NONE, timeout, None, done)
-
-    @property
-    def default_adapter(self):
-        if not self.adapters:
-            return None
-        powered = [a for a in self.adapters.values() if a.powered]
-        pool = powered or list(self.adapters.values())
-        return sorted(pool, key=lambda a: a.path)[0]
-
-    @property
-    def available(self):
-        return self.manager.get_name_owner() is not None
-
-    # -- internals --------------------------------------------------------
-
-    def _queue_changed(self):
-        if self._changed_pending:
-            return
-        self._changed_pending = True
-
-        def fire():
-            self._changed_pending = False
-            self.emit("changed")
-            return GLib.SOURCE_REMOVE
-
-        GLib.idle_add(fire)
-
-    def _add(self, path, iface_name, emit=True):
-        if iface_name == ADAPTER_IFACE and path not in self.adapters:
-            self.adapters[path] = Adapter(self, path)
-            if emit:
-                self.emit("adapter-added", self.adapters[path])
-        elif iface_name == DEVICE_IFACE and path not in self.devices:
-            self.devices[path] = Device(self, path)
-            if emit:
-                self.emit("device-added", self.devices[path])
-        elif iface_name == BATTERY_IFACE and path in self.devices:
-            self.devices[path].emit("changed")
-        else:
-            return
-        self._queue_changed()
-
-    def _on_object_added(self, _manager, obj):
-        for iface in obj.get_interfaces():
-            self._add(obj.get_object_path(), iface.get_interface_name())
-
-    def _on_object_removed(self, manager, obj):
-        for iface in obj.get_interfaces():
-            self._on_interface_removed(manager, obj, iface)
-
-    def _on_interface_added(self, _manager, obj, iface):
-        self._add(obj.get_object_path(), iface.get_interface_name())
-
-    def _on_interface_removed(self, _manager, obj, iface):
-        path = obj.get_object_path()
-        name = iface.get_interface_name()
-        if name == ADAPTER_IFACE and path in self.adapters:
-            self.emit("adapter-removed", self.adapters.pop(path))
-        elif name == DEVICE_IFACE and path in self.devices:
-            self.emit("device-removed", self.devices.pop(path))
-        elif name == BATTERY_IFACE and path in self.devices:
-            # The proxy is still cached during this signal; re-emit afterwards.
-            GLib.idle_add(lambda: self.devices.get(path) and self.devices[path].emit("changed"))
-        else:
-            return
-        self._queue_changed()
-
-    def _on_props_changed(self, _manager, obj, _iface, _changed, _invalidated):
-        path = obj.get_object_path()
-        target = self.devices.get(path) or self.adapters.get(path)
-        if target is not None:
-            target.emit("changed")
-            self._queue_changed()
+            iface, changed, invalidated = msg.body
+            props = self.objects.setdefault(msg.path, {}).setdefault(iface, {})
+            props.update(_unwrap(changed))
+            for name in invalidated:
+                props.pop(name, None)
+            self._mark(msg.path)

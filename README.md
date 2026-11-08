@@ -1,30 +1,50 @@
 # bluestar
 
-A small Bluetooth manager for Linux — an alternative to blueman.
-GTK4 + libadwaita on top of BlueZ's D-Bus API, with a green-on-black terminal look.
+A Bluetooth manager for the terminal, and an alternative to blueman.
+It's a [Textual](https://textual.textualize.io/) TUI on top of BlueZ's D-Bus API, with a green-on-black look, plus a
+small tray daemon for your bar.
 
 ![bluestar screenshot](docs/screenshot.png)
 
 ## Features
 
-- **Scan** for nearby devices (auto-stops after 60 s)
-- **Pair + connect** in one click, with prompts for PIN / passkey / confirmation codes (built-in BlueZ pairing agent)
-- **Connect / disconnect** paired devices, battery level shown when the device reports it
-- **Remove**, trust, block and rename devices; details dialog with supported profiles
-- **Adapter** power switch (unblocks rfkill if needed), visibility, pairable, name
-- **Tray icon** (StatusNotifierItem, no libappindicator needed — works with waybar, KDE, …):
-  left-click toggles the window, right-click menu to power on/off and connect paired devices,
-  notifications when devices connect/disconnect
+- **Scan** for nearby devices (auto-stops after 60 s). Devices that only report an address are hidden unless you ask for them.
+- **Pair + connect** in one keystroke, with PIN, passkey and confirmation prompts handled by a built-in pairing agent.
+- **Connect / disconnect** paired devices, with battery level and signal strength shown.
+- **Remove**, trust, block and rename devices, plus an info view with supported profiles.
+- **Adapter**: power on/off (unblocks rfkill if needed) and visibility.
+- **Tray daemon** (`--tray`): a StatusNotifierItem icon that works with waybar, KDE and others, with no GTK or appindicator.
+  - Left-click opens or closes the TUI in a floating terminal.
+  - The right-click menu toggles power and connects or disconnects paired devices.
+  - It notifies you when devices connect or disconnect.
+  - It answers pairing requests while the TUI is closed, using notification buttons.
+
+## Keys
+
+| key | action |
+| --- | --- |
+| `s` | start / stop scan |
+| `enter` | connect / disconnect, or pair + connect a new device |
+| `d` | remove (forget) device |
+| `t` / `b` | toggle trusted / blocked |
+| `r` | rename |
+| `i` | device info |
+| `p` | power adapter on / off |
+| `v` | toggle visibility to other devices |
+| `u` | show / hide unnamed nearby devices |
+| `q` / `esc` | quit |
+
+The mouse works too. `↑`/`↓` move between the paired and nearby lists.
 
 ## Requirements
 
 - BlueZ 5 (`bluetoothd` running)
-- Python 3 with PyGObject, GTK 4 and libadwaita ≥ 1.6
+- Python 3 with Textual and dbus-fast
 
 On Debian/Ubuntu:
 
 ```sh
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 bluez
+sudo apt install python3-textual python3-dbus-fast bluez
 ```
 
 ## Usage
@@ -32,19 +52,23 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 bluez
 ```sh
 git clone https://github.com/dellambrogio/bluestar.git
 cd bluestar
-./bin/bluestar            # open the window
-./bin/bluestar --tray     # run in the background with a tray icon + pairing agent
-./bin/bluestar --toggle   # show/hide the window of the running instance
+./bin/bluestar            # run the TUI in the current terminal
+./bin/bluestar --toggle   # open the TUI in a new terminal window, or close it
+./bin/bluestar --tray     # background daemon: tray icon, notifications, pairing agent
 ```
 
 Link it into your `PATH` if you like: `ln -s "$PWD/bin/bluestar" ~/.local/bin/bluestar`.
+
+`--toggle` and the tray icon start the TUI in kitty, foot, alacritty, wezterm or ghostty (whichever is found first), with
+the window class / app_id `bluestar`. To use something else, set `"terminal"` in `~/.config/bluestar/settings.json`,
+e.g. `["foot", "--app-id", "bluestar"]`.
 
 ### sway / waybar
 
 ```
 # ~/.config/sway/config
 exec sleep 2 && ~/.local/bin/bluestar --tray
-for_window [app_id="io.github.bluestar.Bluestar"] floating enable, resize set 800 600, move position mouse, move up 40 px
+for_window [app_id="bluestar"] floating enable, resize set 1000 600, move position mouse, move up 40 px
 ```
 
 ```jsonc
@@ -60,12 +84,13 @@ If you were using blueman, stop `blueman-applet` so the two pairing agents don't
 
 | File | Purpose |
 | --- | --- |
-| `bluestar/bluez.py` | GObject wrapper around `org.bluez` (adapters, devices, battery) |
-| `bluestar/window.py` | main window, device rows, dialogs |
-| `bluestar/agent.py` | `org.bluez.Agent1` pairing agent |
-| `bluestar/tray.py` | StatusNotifierItem + dbusmenu tray icon |
-| `bluestar/app.py` | application, command line, notifications |
-| `bluestar/style.css` | the green-on-black theme |
+| `bluestar/bluez.py` | asyncio mirror of `org.bluez` (adapters, devices, battery) on dbus-fast |
+| `bluestar/tui.py` | the Textual app, dialogs and theme |
+| `bluestar/agent.py` | `org.bluez.Agent1` pairing agent with pluggable prompts |
+| `bluestar/daemon.py` | `--tray`: tray icon, notifications, background pairing agent |
+| `bluestar/tray.py` | StatusNotifierItem + dbusmenu |
+| `bluestar/notify.py` | desktop notifications with action buttons |
+| `bluestar/util.py` | labels, settings, terminal launching |
 
 Settings live in `~/.config/bluestar/settings.json`.
 

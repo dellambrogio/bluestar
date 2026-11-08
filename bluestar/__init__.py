@@ -1,4 +1,3 @@
-"""Bluestar - a small, modern Bluetooth manager for Linux (BlueZ + GTK4/libadwaita)."""
+"""bluestar - a Bluetooth manager for the terminal (BlueZ + Textual)."""
 
-__version__ = "0.1.0"
-APP_ID = "io.github.bluestar.Bluestar"
+__version__ = "0.2.0"
