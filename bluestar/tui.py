@@ -68,6 +68,11 @@ CSS = f"""
 Screen {{
     background: #000000;
     color: {GREEN};
+    overflow: hidden;
+}}
+#body {{
+    height: 1fr;
+    overflow: hidden;
 }}
 #header {{
     height: 1;
@@ -79,6 +84,7 @@ DeviceTable {{
     border: round {GREEN_DARK};
     border-title-color: {GREEN_DIM};
     border-title-style: bold;
+    width: 1fr;
     padding: 0 1;
     scrollbar-size-vertical: 1;
     overflow-x: hidden;
@@ -95,19 +101,16 @@ DeviceTable > .datatable--header {{
 DeviceTable > .datatable--hover {{
     background: #001a00;
 }}
-#paired {{
+#paired, #nearby {{
     height: auto;
-    max-height: 40%;
-}}
-#nearby {{
-    height: auto;
-    max-height: 55%;
 }}
 #spacer {{
     height: 1fr;
 }}
 #hint {{
     height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
     padding: 0 1;
     color: {GREEN_DIM};
     display: none;
@@ -127,8 +130,10 @@ ModalScreen {{
 }}
 .dialog {{
     width: 64;
-    max-width: 90%;
+    max-width: 100%;
     height: auto;
+    max-height: 100%;
+    overflow-y: auto;
     border: double {GREEN};
     border-title-color: {GREEN};
     border-title-style: bold;
@@ -304,7 +309,38 @@ class DeviceTable(DataTable):
             super().action_cursor_up()
 
 
-COLUMNS = [("", 1), ("name", 22), ("type", 10), ("battery", 12), ("signal", 6), ("state", 15), ("address", 17)]
+# (key, label, width) in display order; the name column is flexible (width = minimum).
+COLUMNS = [("glyph", "", 1), ("name", "name", 12), ("type", "type", 10), ("battery", "battery", 12),
+           ("signal", "signal", 6), ("state", "state", 16), ("address", "address", 17)]
+# Columns dropped first when the terminal gets narrow.
+# The state column goes last: the glyph in front of the name still shows ●/○/+.
+DROP_ORDER = ["address", "type", "signal", "battery", "state"]
+NAME_MAX = 32
+CELL_PAD = 2      # DataTable puts one space on each side of every cell
+TABLE_CHROME = 5  # border (2) + padding (2) + vertical scrollbar (1)
+
+
+def column_layout(width):
+    """Pick the columns that fit in ``width`` cells: [(key, label, width), ...]."""
+    avail = max(0, width - TABLE_CHROME)
+    keys = [k for k, _l, _w in COLUMNS]
+    widths = {k: w for k, _l, w in COLUMNS}
+
+    def need(ks):
+        return sum(widths[k] + CELL_PAD for k in ks)
+
+    for drop in DROP_ORDER:
+        if need(keys) <= avail:
+            break
+        keys.remove(drop)
+    if "state" in keys:  # "paired · trusted" needs 16, but a longer name matters more
+        short = max(0, need(keys) + 4 - avail)
+        widths["state"] -= min(short, 6)
+    spare = max(0, avail - need(keys))
+    widths["name"] += min(spare, NAME_MAX - widths["name"])
+    if need(keys) > avail:  # tiny terminal: squeeze the name
+        widths["name"] = max(4, widths["name"] - (need(keys) - avail))
+    return [(k, label, widths[k]) for k, label, _w in COLUMNS if k in keys]
 
 
 # -- the app ----------------------------------------------------------------------------------
@@ -405,23 +441,27 @@ class BluestarTUI(App):
         self.scan_task = None
         self.frame = 0
         self.message = Text("")
+        self.columns = column_layout(120)
 
     # -- layout ---------------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
+        with Vertical(id="body"):
+            yield from self._compose_body()
+        yield Static(id="log")
+        yield Footer()
+
+    def _compose_body(self):
         paired = DeviceTable(id="paired", cursor_type="row", zebra_stripes=False)
         paired.border_title = "\\[ paired ]"
         nearby = DeviceTable(id="nearby", cursor_type="row", zebra_stripes=False)
         nearby.border_title = "\\[ nearby ]"
         for table in (paired, nearby):
-            for label, width in COLUMNS:
-                table.add_column(label, width=width, key=label or "glyph")
+            self._add_columns(table)
             yield table
         yield Static(id="hint")
         yield Static(id="spacer")
-        yield Static(id="log")
-        yield Footer()
 
     async def on_mount(self):
         self.register_theme(THEME)
@@ -480,27 +520,65 @@ class BluestarTUI(App):
 
     def _render_header(self):
         a = self.adapter
-        t = Text()
-        t.append("> bluestar_", style=f"bold {GREEN}")
-        t.append(f"  v{__version__}   ", style=GREEN_DARK)
+        width = self.size.width - 2
+        wide, narrow = width >= 90, width < 48
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append("> bluestar_" if not narrow else ">_", style=f"bold {GREEN}")
+        if wide:
+            t.append(f"  v{__version__}", style=GREEN_DARK)
+        t.append("  ")
         if a is None:
             t.append("no adapter" if self.client.available else "bluetoothd not running", style=f"bold {RED}")
         else:
-            t.append(a.alias, style=f"bold {GREEN}")
-            t.append("  power:", style=GREEN_DIM)
+            if not narrow:
+                t.append(a.alias + "  ", style=f"bold {GREEN}")
+            t.append("power:" if not narrow else "pwr:", style=GREEN_DIM)
             t.append(" on " if a.powered else " off ",
                      style=f"bold #000000 on {GREEN}" if a.powered else f"bold #000000 on {RED}")
-            t.append("  visible:", style=GREEN_DIM)
-            t.append("yes" if a.discoverable else "no", style=GREEN if a.discoverable else GREEN_DIM)
-            t.append("  scan:", style=GREEN_DIM)
+            if not narrow or a.discoverable:
+                t.append("  visible:" if not narrow else " vis:", style=GREEN_DIM)
+                t.append("yes" if a.discoverable else "no", style=GREEN if a.discoverable else GREEN_DIM)
+            t.append("  scan:" if not narrow else " ", style=GREEN_DIM)
             if self.scan_started and a.discovering:
                 left = SCAN_SECONDS - int(time.monotonic() - self.scan_started)
-                t.append(f"{SPINNER[self.frame]} scanning {max(left, 0)}s", style=f"bold {GREEN}")
+                t.append(f"{SPINNER[self.frame]} {'scanning ' if not narrow else ''}{max(left, 0)}s",
+                         style=f"bold {GREEN}")
             elif a.discovering:
-                t.append(f"{SPINNER[self.frame]} scanning (other app)", style=GREEN_DIM)
-            else:
+                t.append(f"{SPINNER[self.frame]} " + ("scanning (other app)" if wide else "other app"),
+                         style=GREEN_DIM)
+            elif not narrow:
                 t.append("idle", style=GREEN_DIM)
         self.main.query_one("#header", Static).update(t)
+
+    def _add_columns(self, table):
+        for key, label, width in self.columns:
+            table.add_column(label, width=width, key=key)
+
+    def on_resize(self, event):
+        # Split the body between the two lists, but always keep at least one row of each visible.
+        body = max(0, event.size.height - 3)  # header, log, footer
+        header = event.size.height >= 16
+        floor = 4 if header else 3
+        paired, nearby = self._tables()
+        paired.styles.max_height = max(floor, body * 40 // 100)
+        nearby.styles.max_height = max(floor, body * 55 // 100)
+        for table in (paired, nearby):
+            table.show_header = header
+        layout = column_layout(event.size.width)
+        if layout == self.columns:
+            self._render_header()
+            return
+        self.columns = layout
+        for table in self._tables():
+            selected = self._selected_key(table)
+            table.clear(columns=True)
+            self._add_columns(table)
+            table.refresh()
+            table._bluestar_selected = selected
+        self.refresh_all()
+
+    def _tables(self):
+        return [self.main.query_one("#paired", DeviceTable), self.main.query_one("#nearby", DeviceTable)]
 
     def _row(self, d):
         busy = self.busy.get(d.path)
@@ -527,15 +605,17 @@ class BluestarTUI(App):
             state = Text("new", style=GREEN_DIM)
 
         name_style = f"bold {GREEN}" if d.connected else (GREEN if d.has_name else GREEN_DIM)
-        return [
-            Text(glyph, style=gstyle),
-            Text(d.alias, style=name_style, overflow="ellipsis", no_wrap=True),
-            Text(type_label(d.icon), style=GREEN_DIM),
-            Text(battery_bar(d.battery)),
-            self._signal(d.rssi),
-            state,
-            Text(d.address, style=GREEN_DARK),
-        ]
+        state.overflow, state.no_wrap = "ellipsis", True
+        cells = {
+            "glyph": Text(glyph, style=gstyle),
+            "name": Text(d.alias, style=name_style, overflow="ellipsis", no_wrap=True),
+            "type": Text(type_label(d.icon), style=GREEN_DIM, overflow="ellipsis", no_wrap=True),
+            "battery": Text(battery_bar(d.battery)),
+            "signal": self._signal(d.rssi),
+            "state": state,
+            "address": Text(d.address, style=GREEN_DARK),
+        }
+        return [cells[key] for key, _l, _w in self.columns]
 
     @staticmethod
     def _signal(rssi):
@@ -558,7 +638,8 @@ class BluestarTUI(App):
         self._fill(self.main.query_one("#nearby", DeviceTable), nearby)
         hidden = sum(1 for d in devices if not d.paired) - len(nearby)
         nb = self.main.query_one("#nearby", DeviceTable)
-        nb.border_subtitle = f"{hidden} unnamed hidden · \\[u] show" if hidden and not show_unnamed else ""
+        nb.border_subtitle = (f"{hidden} unnamed hidden" + (" · \\[u] show" if self.size.width >= 50 else "")
+                              if hidden and not show_unnamed else "")
         hint = self.main.query_one("#hint", Static)
         hint.display = not nearby
         if not nearby:
@@ -567,13 +648,14 @@ class BluestarTUI(App):
                         else "// no nearby devices. press \\[s] to scan")
 
     def _fill(self, table, devices):
-        selected = self._selected_key(table)
+        selected = getattr(table, "_bluestar_selected", None) or self._selected_key(table)
+        table._bluestar_selected = None
         keys = [d.path for d in devices]
         current = [rk.value for rk in table.rows]
         if keys == current:
             for d in devices:
-                for (label, _w), value in zip(COLUMNS, self._row(d)):
-                    table.update_cell(d.path, label or "glyph", value)
+                for (key, _l, _w), value in zip(self.columns, self._row(d)):
+                    table.update_cell(d.path, key, value)
             return
         table.clear()
         for d in devices:
@@ -600,8 +682,9 @@ class BluestarTUI(App):
 
     def log_message(self, message, error=False):
         stamp = time.strftime("%H:%M:%S")
-        t = Text()
-        t.append(f"[{stamp}] ", style=GREEN_DARK)
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if self.size.width >= 60:
+            t.append(f"[{stamp}] ", style=GREEN_DARK)
         t.append(message, style=RED if error else GREEN_DIM)
         self.main.query_one("#log", Static).update(t)
 
