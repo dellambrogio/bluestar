@@ -3,12 +3,7 @@
 A small Bluetooth manager for Linux — an alternative to blueman.
 GTK4 + libadwaita on top of BlueZ's D-Bus API, with a green-on-black terminal look.
 
-```
-> bluestar_
-[ paired ]   Headphones  connected  [ Disconnect ]
-             Speaker                 [  Connect   ]
-[ nearby ]   // press scan to look for devices.
-```
+![bluestar screenshot](docs/screenshot.png)
 
 ## Features
 
