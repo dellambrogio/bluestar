@@ -52,7 +52,8 @@ class NotificationPrompter:
 
 
 class Daemon:
-    def __init__(self):
+    def __init__(self, icon=True):
+        self.icon = icon
         self.settings = Settings()
         self.client = Bluez()
         self.tray = None
@@ -72,8 +73,9 @@ class Daemon:
         except BluezError as err:
             print(f"bluestar: could not register pairing agent: {err.message}")
 
-        self.tray = await TrayIcon(session, on_activate=lambda: toggle_tui(self.settings),
-                                   build_menu=self._menu, on_secondary=self._toggle_power).start()
+        if self.icon:
+            self.tray = await TrayIcon(session, on_activate=lambda: toggle_tui(self.settings),
+                                       build_menu=self._menu, on_secondary=self._toggle_power).start()
         self._connected = {d.path: d.connected for d in self.client.devices}
         self.client.listeners.append(self._on_change)
         self._on_change(set())
@@ -102,6 +104,8 @@ class Daemon:
         self._update_tray()
 
     def _update_tray(self):
+        if self.tray is None:
+            return
         adapter = self.adapter
         if adapter is None or not adapter.powered:
             icon, tip = "bluetooth-disabled-symbolic", "bluetooth is off" if adapter else "no adapter"
@@ -150,6 +154,6 @@ class Daemon:
             await self.notifier.notify(device.alias, f"failed: {err.message}")
 
 
-def run():
-    asyncio.run(Daemon().run())
+def run(icon=True):
+    asyncio.run(Daemon(icon).run())
     return 0

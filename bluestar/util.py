@@ -113,6 +113,9 @@ class Settings:
         "adapter": None,
         # Command used by the tray / --toggle to open the TUI; empty = auto-detect.
         "terminal": [],
+        # Where the TUI moves its own floating window under sway: bottom-right, bottom-left,
+        # top-right, top-left, or null to leave it where sway put it.
+        "position": "bottom-right",
     }
 
     def __init__(self):
@@ -238,3 +241,51 @@ def open_tui(settings=None):
     cmd = terminal_command(settings or Settings()) + bluestar_command()
     subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# -- sway placement ---------------------------------------------------------------------------
+
+async def place_on_sway(position="bottom-right", margin=6):
+    """Move our own floating terminal window (app_id ``bluestar``) to a corner of the workspace.
+
+    sway ignores ``move`` commands in a for_window rule while a terminal is still sizing its
+    window, so the TUI does it itself once it is running. Tiled windows are left alone.
+    """
+    if not position or not os.environ.get("SWAYSOCK") or not shutil.which("swaymsg"):
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "swaymsg", "-r", "-t", "get_tree", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        tree = json.loads(out)
+    except (OSError, ValueError):
+        return
+
+    terminal_pid = os.getppid()
+    found = None
+
+    def walk(node, workspace):
+        nonlocal found
+        if node.get("type") == "workspace":
+            workspace = node
+        if (node.get("app_id") == APP_ID and node.get("pid") == terminal_pid
+                and node.get("type") == "floating_con"):
+            found = (node, workspace)
+            return
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            if found is None:
+                walk(child, workspace)
+
+    walk(tree, None)
+    if found is None or found[1] is None:
+        return
+    win, ws = found[0]["rect"], found[1]["rect"]
+    deco = found[0].get("deco_rect", {}).get("height", 0)  # title bar sits above the content rect
+    right = position.endswith("right")
+    bottom = position.startswith("bottom")
+    x = ws["x"] + (ws["width"] - win["width"] - margin if right else margin)
+    y = ws["y"] + (ws["height"] - win["height"] - deco - margin if bottom else margin)
+    proc = await asyncio.create_subprocess_exec(
+        "swaymsg", f"[con_id={found[0]['id']}]", "move", "absolute", "position", str(x), str(y),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    await proc.wait()

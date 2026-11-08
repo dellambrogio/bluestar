@@ -55,6 +55,7 @@ cd bluestar
 ./bin/bluestar            # run the TUI in the current terminal
 ./bin/bluestar --toggle   # open the TUI in a new terminal window, or close it
 ./bin/bluestar --tray     # background daemon: tray icon, notifications, pairing agent
+./bin/bluestar --daemon   # same, without a tray icon (e.g. if your bar has its own bluetooth module)
 ```
 
 Link it into your `PATH` if you like: `ln -s "$PWD/bin/bluestar" ~/.local/bin/bluestar`.
@@ -63,12 +64,16 @@ Link it into your `PATH` if you like: `ln -s "$PWD/bin/bluestar" ~/.local/bin/bl
 the window class / app_id `bluestar`. To use something else, set `"terminal"` in `~/.config/bluestar/settings.json`,
 e.g. `["foot", "--app-id", "bluestar"]`.
 
+Under sway, the TUI moves its own floating window into the bottom-right corner of the workspace, above the bar.
+sway ignores `move` commands in a `for_window` rule while the terminal is still sizing its window, which is why the
+TUI does it itself. Set `"position"` in the settings file to `bottom-left`, `top-right`, `top-left` or `null`.
+
 ### sway / waybar
 
 ```
 # ~/.config/sway/config
-exec sleep 2 && ~/.local/bin/bluestar --tray
-for_window [app_id="bluestar"] floating enable, resize set 1000 600, move position mouse, move up 40 px
+exec sleep 2 && ~/.local/bin/bluestar --daemon     # or --tray for an icon with a quick-connect menu
+for_window [app_id="bluestar"] floating enable, resize set 1000 600
 ```
 
 ```jsonc
@@ -87,7 +92,7 @@ If you were using blueman, stop `blueman-applet` so the two pairing agents don't
 | `bluestar/bluez.py` | asyncio mirror of `org.bluez` (adapters, devices, battery) on dbus-fast |
 | `bluestar/tui.py` | the Textual app, dialogs and theme |
 | `bluestar/agent.py` | `org.bluez.Agent1` pairing agent with pluggable prompts |
-| `bluestar/daemon.py` | `--tray`: tray icon, notifications, background pairing agent |
+| `bluestar/daemon.py` | `--tray` / `--daemon`: tray icon, notifications, background pairing agent |
 | `bluestar/tray.py` | StatusNotifierItem + dbusmenu |
 | `bluestar/notify.py` | desktop notifications with action buttons |
 | `bluestar/util.py` | labels, settings, terminal launching |

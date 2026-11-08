@@ -15,7 +15,7 @@ from textual.widgets import DataTable, Footer, Input, Static
 from . import __version__
 from .agent import Agent
 from .bluez import Bluez, BluezError
-from .util import (Settings, battery_bar, profile_name, remove_pidfile, set_powered, signal_bars,
+from .util import (Settings, battery_bar, place_on_sway, profile_name, remove_pidfile, set_powered, signal_bars,
                    type_label, write_pidfile)
 
 AGENT_PATH = "/io/github/bluestar/tui_agent"
@@ -426,6 +426,7 @@ class BluestarTUI(App):
         self.register_theme(THEME)
         self.theme = "bluestar"
         write_pidfile()
+        self.run_worker(place_on_sway(self.settings["position"]), exclusive=False)
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, lambda: self.call_later(self.action_quit))
         try:
