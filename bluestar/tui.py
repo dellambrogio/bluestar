@@ -289,7 +289,7 @@ class InfoScreen(ModalScreen):
 class DeviceTable(DataTable):
     """DataTable that hands focus to the neighbouring table at its top/bottom edge."""
 
-    BINDINGS = [Binding("enter", "select_cursor", "connect/pair", show=True)]
+    BINDINGS = [Binding("enter", "select_cursor", "connect", show=True)]
 
     def action_cursor_down(self):
         if self.row_count == 0 or self.cursor_row >= self.row_count - 1:
@@ -382,6 +382,7 @@ class BluestarTUI(App):
     BINDINGS = [
         Binding("s", "scan", "scan"),
         Binding("c", "primary", "connect/pair", show=False),
+        Binding("x", "disconnect", "disconnect"),
         Binding("d,delete", "remove", "remove"),
         Binding("t", "trust", "trust"),
         Binding("b", "block", "block", show=False),
@@ -443,7 +444,7 @@ class BluestarTUI(App):
         self.set_interval(0.1, self._tick)
         self.refresh_all()
         self.main.query_one("#paired", DeviceTable).focus()
-        self.log_message("ready. [s] scan  [enter] connect  [d] remove")
+        self.log_message("ready. [s] scan  [enter] connect/disconnect  [x] disconnect  [d] remove")
 
     async def action_quit(self):
         await self._stop_scan()
@@ -646,14 +647,29 @@ class BluestarTUI(App):
         d = self.selected_device()
         if d is None or d.path in self.busy:
             return
-        if d.blocked:
+        if d.connected:
+            await self._disconnect(d)
+        elif d.blocked:
             self.log_message(f"{d.alias} is blocked; press [b] to unblock", error=True)
         elif not d.paired:
             await self._pair_and_connect(d)
-        elif d.connected:
-            await self._run(d, "disconnecting...", d.disconnect(), f"disconnected {d.alias}")
         else:
             await self._run(d, "connecting...", d.connect(), f"connected {d.alias}")
+
+    async def _disconnect(self, d):
+        await self._run(d, "disconnecting...", d.disconnect(), f"disconnected {d.alias}")
+
+    def action_disconnect(self):
+        self.run_worker(self._do_disconnect(), group="actions", exclusive=False)
+
+    async def _do_disconnect(self):
+        d = self.selected_device()
+        if d is None or d.path in self.busy:
+            return
+        if not d.connected:
+            self.log_message(f"{d.alias} is not connected")
+            return
+        await self._disconnect(d)
 
     async def _pair_and_connect(self, d):
         await self._stop_scan()  # discovery slows pairing down a lot
@@ -700,11 +716,19 @@ class BluestarTUI(App):
         """Stop the discovery *we* started (other programs may be scanning too)."""
         a = self.adapter
         started, self.scan_started = self.scan_started, None
-        if a is not None and started:
+        if a is None or not started:
+            return
+        # BlueZ answers InProgress while a start/stop is still pending; giving up there would
+        # leave our discovery session running forever, so retry for a few seconds.
+        for _ in range(20):
             try:
                 await a.stop_discovery()
-            except BluezError:
-                pass
+                return
+            except BluezError as err:
+                if err.short != "InProgress":
+                    return  # e.g. "No discovery started": nothing left to stop
+            await asyncio.sleep(0.25)
+        self.log_message("could not stop scanning", error=True)
 
     def action_remove(self):
         self.run_worker(self._do_remove(), group="actions", exclusive=False)

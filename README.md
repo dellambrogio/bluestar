@@ -25,6 +25,7 @@ small tray daemon for your bar.
 | --- | --- |
 | `s` | start / stop scan |
 | `enter` | connect / disconnect, or pair + connect a new device |
+| `x` | disconnect |
 | `d` | remove (forget) device |
 | `t` / `b` | toggle trusted / blocked |
 | `r` | rename |
